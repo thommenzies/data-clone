@@ -1,29 +1,11 @@
 #------------------------------------------------------------------------------------------------------------------------------
-# TABLES
-#------------------------------------------------------------------------------------------------------------------------------
-
-#Create table to house the names of tables to be INCLUDED (empty if all tables required)
-Drop Table if exists data_clone_inclusions;
-Create Table data_clone_inclusions 
-	( 
-	tbl_name varchar(100) NOT NULL
-	) Engine = InnoDB;
-	
-#Create table to house the names of tables to be EXCLUDED (empty if no specific exclusions required)
-Drop Table if exists data_clone_exclusions;
-Create Table data_clone_exclusions 
-	( 
-	tbl_name varchar(100) NOT NULL
-	) Engine = InnoDB;
-
-#------------------------------------------------------------------------------------------------------------------------------
 # PROCEDURES
 #------------------------------------------------------------------------------------------------------------------------------
 
 DELIMITER $$
 
-DROP PROCEDURE IF EXISTS clone_data$$
-CREATE PROCEDURE clone_data (IN schemaname varchar(50), IN rowlimit Int, IN includefieldname Boolean, IN tempcleanup Boolean)
+DROP PROCEDURE IF EXISTS data_clone$$
+CREATE PROCEDURE data_clone (IN schemaname varchar(50), IN rowlimit Int, IN includefieldname Boolean, IN tempcleanup Boolean)
 Begin
 
 Declare sql_statement varchar(10000);
@@ -35,18 +17,28 @@ Set @Tab = '\t';
 Set @format_script = False;
 Set @row_limit = rowlimit;
 
-#Create table to house the names of tables to be INCLUDED (empty if all tables required)
-Create Table if not exists data_clone_inclusions 
+#Create table to house the names of tables to be specifically included or excluded (empty if all tables required)
+Create Table if not exists data_clone_table_instructions 
 	( 
-	tbl_name varchar(100) NOT NULL
-	) Engine = InnoDB;
+	tbl_name varchar(100) NOT NULL,
+    instruction char(7)
+	) Engine = InnoDB
+;
 	
-#Create table to house the names of tables to be EXCLUDED (empty if no specific exclusions required)
-Create Table if not exists data_clone_exclusions 
+#Create table to house tables to script out
+Drop Table if exists data_clone_table_list;
+Create Table data_clone_table_list 
 	( 
-	tbl_name varchar(100) NOT NULL
+	id int AUTO_INCREMENT,
+    tbl_name varchar(100) NOT NULL,
+    record_count int NOT NULL,
+    clone_used boolean NOT NULL,
+    clone_status varchar(20) NOT NULL,
+    process_start_dt timestamp NULL,
+    process_end_dt timestamp NULL,
+	Primary Key (id)
 	) Engine = InnoDB;
-	
+
 
 #Create table to house insert statements
 Drop Table if exists data_clone_results;
@@ -54,27 +46,12 @@ Create Table data_clone_results
 	( 
 	tbl_name varchar(100) NOT NULL,
     row_number int NOT NULL,
-    ins_header varchar(10000) NOT NULL,
     ins_statement varchar(10000) NOT NULL
 	) Engine = InnoDB;
 
-
-#Create temp table to house tables to script out
-Drop Table if exists temp_clone_table_list;
-Create Table temp_clone_table_list 
-	( 
-	id int AUTO_INCREMENT,
-    t_name varchar(100) NOT NULL,
-    r_count int NOT NULL,
-    clone_used boolean NOT NULL,
-    clone_status varchar(20) NOT NULL,
-	Primary Key (id)
-	) Engine = InnoDB;
-
-
 #Create temp table to house fields belonging to a table to script out
-Drop Table if exists temp_clone_field_list;
-Create Table temp_clone_field_list 
+Drop Table if exists data_clone_temp_field_list;
+Create Table data_clone_temp_field_list 
 	( 
 	id int AUTO_INCREMENT,
     f_name varchar(100) NOT NULL,
@@ -83,10 +60,10 @@ Create Table temp_clone_field_list
 	) Engine = InnoDB;
 
 #Insert into temp table tables to script out
-Insert Into temp_clone_table_list
+Insert Into data_clone_table_list
 	(
-    t_name
-    ,r_count
+    tbl_name
+    ,record_count
     ,clone_used
     ,clone_status
     )
@@ -102,9 +79,8 @@ Insert Into temp_clone_table_list
 	And
 		TABLE_TYPE = 'BASE TABLE'
 	And
-		TABLE_NAME Not In ('data_clone_results','data_clone_inclusions','data_clone_exclusions','temp_clone_table','temp_clone_table_list', 'temp_clone_field_list')
+        TABLE_NAME Not Like 'data_clone_%'
 	; 
-
 
 #Set the total number of tables for the loop
 Select
@@ -112,7 +88,7 @@ Select
 Into
 	@table_count
 From
-	temp_clone_table_list
+	data_clone_table_list
 ;
 
 #Capture whether the inclusions table is being used
@@ -121,12 +97,13 @@ Select
 Into
 	@inclusions
 From
-	data_clone_inclusions
+	data_clone_table_instructions
+Where
+	instruction = 'INCLUDE'
 ;
 
 Set @script_insert = '';
 Set @t = 0;
-Set @all_data_rows = '';
 
 TableLoop: LOOP
     
@@ -142,21 +119,23 @@ TableLoop: LOOP
         Set @auto_increment_field = '';
         
         #Set current table name
-        Select t_name Into @current_table From temp_clone_table_list Where id = @t;
+        Select tbl_name Into @current_table From data_clone_table_list Where id = @t;
         
-        If Exists (Select 1 From data_clone_exclusions Where tbl_name = @current_table) Then
+        #Exclude tables in the exclusions table or are not in the inclusions table where it is being used
+        If Exists (Select 1 From data_clone_table_instructions Where instruction = 'EXCLUDE' And tbl_name = @current_table) Or (@inclusions > 0 And Not Exists (Select 1 From data_clone_table_instructions Where instruction = 'INCLUDE' And tbl_name = @current_table)) Then
 		
-			Update temp_clone_table_list Set clone_status = 'EXCLUDED' Where id = @t;
+			Update data_clone_table_list Set clone_status = 'EXCLUDED', process_start_dt = Now(), process_end_dt = Now() Where id = @t;
             ITERATE TableLoop;
         
-        ElseIf (Select r_count From temp_clone_table_list Where t_name = @current_table) = 0 Then
+        #Ignore empty tables
+        ElseIf (Select record_count From data_clone_table_list Where tbl_name = @current_table) = 0 Then
         
-            Update temp_clone_table_list Set clone_status = 'IGNORED' Where id = @t;
+            Update data_clone_table_list Set clone_status = 'IGNORED', process_start_dt = Now(), process_end_dt = Now() Where id = @t;
             ITERATE TableLoop;
 		
 		Else
         
-			Update temp_clone_table_list Set clone_status = 'STARTED' Where id = @t;
+			Update data_clone_table_list Set clone_status = 'STARTED', process_start_dt = Now() Where id = @t;
         
         End If;
         
@@ -166,40 +145,40 @@ TableLoop: LOOP
 
         If @auto_increment_field = 'No field set' Then
 			
-            Drop Table If Exists temp_clone_table;
+            Drop Table If Exists data_clone_temp_table;
             
             #Write the entire table into a temp table
-			Set sql_statement = Concat('Create Table temp_clone_table (Select * From ',@current_table,' Where 1<>1);');
+			Set sql_statement = Concat('Create Table data_clone_temp_table (Select * From ',@current_table,' Where 1<>1);');
 			Select sql_statement Into @sql_statement;
 			Prepare SQLCommand From @sql_statement;
 			Execute SQLCommand;
             
 			#Add an incremental ID to identify each row
-			Alter Table temp_clone_table ADD COLUMN temp_clone_id bigint NOT NULL PRIMARY KEY; 
+			Alter Table data_clone_temp_table ADD COLUMN temp_clone_id bigint NOT NULL PRIMARY KEY; 
             
             Set @RowNumber := 0;
             
             #Add data from table
-            Set sql_statement = Concat('Insert Into temp_clone_table Select *,@RowNumber := @RowNumber + 1 From ', @current_table,';');
+            Set sql_statement = Concat('Insert Into data_clone_temp_table Select *,@RowNumber := @RowNumber + 1 From ', @current_table,';');
 			Select sql_statement Into @sql_statement;
             
 			Prepare SQLCommand From @sql_statement;
 			Execute SQLCommand;
             
             #Set the table to be based off the temp clone table
-            #Set @current_table = 'temp_clone_table';            
+            #Set @current_table = 'data_clone_temp_table';            
             Set @auto_increment_field = 'temp_clone_id';
-			Update temp_clone_table_list Set clone_used = True Where id = @t;
+			Update data_clone_table_list Set clone_used = True Where id = @t;
 	
         End If;
 
-        Select clone_used Into @use_clone_table From temp_clone_table_list Where id = @t;
+        Select clone_used Into @use_clone_table From data_clone_table_list Where id = @t;
         
         #Prepare field variables
-        Truncate Table temp_clone_field_list;
+        Truncate Table data_clone_temp_field_list;
         
         #Insert into temp table fields to script out
-		Insert Into temp_clone_field_list
+		Insert Into data_clone_temp_field_list
 			(
 			f_name
 			,f_type
@@ -212,7 +191,7 @@ TableLoop: LOOP
 		Where
 			TABLE_SCHEMA = schemaname
 		And
-			TABLE_NAME = Case @use_clone_table When True Then 'temp_clone_table' Else @current_table End
+			TABLE_NAME = Case @use_clone_table When True Then 'data_clone_temp_table' Else @current_table End
 		And
 			COLUMN_NAME != 'temp_clone_id'
 		Order By
@@ -225,7 +204,7 @@ TableLoop: LOOP
 		Into
 			@field_count
 		From
-			temp_clone_field_list
+			data_clone_temp_field_list
 		;
           
          #Set field variables for field loop
@@ -243,7 +222,7 @@ TableLoop: LOOP
 			
             Else
 					
-                Select f_name Into @f_name From temp_clone_field_list Where id = @f;
+                Select f_name Into @f_name From data_clone_temp_field_list Where id = @f;
                 
 				If @format_script = True Then 
 			
@@ -265,7 +244,7 @@ TableLoop: LOOP
         #Prepare table for row-level scripting
       
         #Set the current table (use clone table if required)
-		Select Case @use_clone_table When True Then 'temp_clone_table' Else t_name End Into @t_name From temp_clone_table_list Where id = @t; 
+		Select Case @use_clone_table When True Then 'data_clone_temp_table' Else tbl_name End Into @t_name From data_clone_table_list Where id = @t; 
 		
         If @format_script = True Then 
 			
@@ -277,12 +256,12 @@ TableLoop: LOOP
 
 		End If;
 		
-        Set sql_statement = Concat('Select Min(',@auto_increment_field,') Into @d From ',@t_name,';');
+        Set sql_statement = Concat('Select Min(',@auto_increment_field,') Into @d From ',schemaname,'.',@t_name,';');
 		Select sql_statement Into @sql_statement;
 		Prepare SQLCommand From @sql_statement;
 		Execute SQLCommand;
         
-        Set sql_statement = Concat('Select Max(',@auto_increment_field,') Into @max_increment From ',@t_name,';');
+        Set sql_statement = Concat('Select Max(',@auto_increment_field,') Into @max_increment From ',schemaname,'.',@t_name,';');
         Select sql_statement Into @sql_statement;
 		Prepare SQLCommand From @sql_statement;
 		Execute SQLCommand;
@@ -292,7 +271,7 @@ TableLoop: LOOP
        
 		DataLoop: Loop 
         
-			Set sql_statement = Concat('Select Case When Count(*) < 1 Then False Else True End Into @record_exists From ',@t_name,' Where ',@auto_increment_field,' = ',@d,';');          
+			Set sql_statement = Concat('Select Case When Count(*) < 1 Then False Else True End Into @record_exists From ',schemaname,'.',@t_name,' Where ',@auto_increment_field,' = ',@d,';');          
 			Select sql_statement Into @sql_statement;
 			Prepare SQLCommand From @sql_statement;
 			Execute SQLCommand;
@@ -306,8 +285,7 @@ TableLoop: LOOP
                 #Reset field variables for data field loop
 				Set @f = 0;
 				Set @f_name = '';
-                #Set @current_data_row = Concat(@script_insert,@NewLine,'(Select ');
-				Set @current_data_row = '(Select ';
+                Set @current_data_row = Concat(@script_insert,@NewLine,'(Select ');
                 
 				DataFieldLoop: Loop
 				
@@ -319,11 +297,19 @@ TableLoop: LOOP
 
 					Else
 
-						Select f_name Into @f_name From temp_clone_field_list Where id = @f;
+						Select f_name Into @f_name From data_clone_temp_field_list Where id = @f;
 
 					End If;
                    
-					Set sql_statement = Concat('Select IfNull(Convert(',@f_name,',char),''CLONE TO NULL'') Into @field_value From ',@t_name,' Where ',@auto_increment_field,' = ',@d,';');
+					If (Select Upper(f_type) From data_clone_temp_field_list Where f_name = @f_name) = 'BIT' Then
+                    
+						Set sql_statement = Concat('Select Case ',@f_name,' When 0 Then ''CLONE TO BIT0'' When 1 Then ''CLONE TO BIT1'' Else ''CLONE TO NULL'' End Into @field_value From ',schemaname,'.',@t_name,' Where ',@auto_increment_field,' = ',@d,';');
+                    
+                    Else
+                    
+						Set sql_statement = Concat('Select IfNull(Convert(',@f_name,',char),''CLONE TO NULL'') Into @field_value From ',schemaname,'.',@t_name,' Where ',@auto_increment_field,' = ',@d,';');
+					
+                    End If;
 
 					Select sql_statement Into @sql_statement;
 					Prepare SQLCommand From @sql_statement;
@@ -345,25 +331,24 @@ TableLoop: LOOP
                 
                 #Tidy up the record
                 Select Replace(@current_data_row,'''CLONE TO NULL''','NULL') Into @current_data_row;
+                Select Replace(@current_data_row,'''CLONE TO BIT0''','0') Into @current_data_row;
+                Select Replace(@current_data_row,'''CLONE TO BIT1''','1') Into @current_data_row;
                 Set @current_data_row = Left(@current_data_row,Length(@current_data_row)-1);
-				Set @current_data_row = Concat(@current_data_row,');');	
+				Set @current_data_row = Concat(@current_data_row,');',@NewLine);	
+                Select Replace(@current_data_row,',);',');') Into @current_data_row;
                 
 				#Insert results into table
 				Insert Into data_clone_results
 					(
 					tbl_name
                     ,row_number
-					,ins_header
 					,ins_statement
 					)
 				Select
 					@current_table
                     ,@row_no
-					,@script_insert
 					,@current_data_row
 				;
-                
-                Set @all_data_rows = Concat(@all_data_rows,@NewLine,@current_data_row);
                 
                 #Increment the physical row count of the table
                 Set @row_no = @row_no + 1;
@@ -375,9 +360,9 @@ TableLoop: LOOP
 		END LOOP DataLoop;
         
         #Clean up
-        Drop Table If Exists temp_clone_table;
+        Drop Table If Exists data_clone_temp_table;
         Set @script_insert = '';
-        Update temp_clone_table_list Set clone_status = 'COMPLETED' Where id = @t;
+        Update data_clone_table_list Set clone_status = 'COMPLETED', process_end_dt = Now() Where id = @t;
 		ITERATE TableLoop;
     END IF;
 END LOOP TableLoop;
@@ -385,16 +370,90 @@ END LOOP TableLoop;
 #Clean up
 If tempcleanup = True Then
 
-	Drop Table If Exists temp_clone_field_list;
-	Drop Table If Exists temp_clone_table_list;
+	Drop Table If Exists data_clone_temp_field_list;
 
 End If;
 
 Select 
-	ins_header
-    ,ins_statement
+    ins_statement
 From
 	data_clone_results
 ;
+
+End$$
+
+
+#------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+DELIMITER $$
+
+DROP PROCEDURE IF EXISTS data_clone_table_instructions$$
+CREATE PROCEDURE data_clone_table_instructions (IN instruction varchar(7), IN schemaname varchar(50), IN tablename varchar(102))
+Begin
+
+#Create table to house the names of tables to be specifically included or excluded (empty if all tables required)
+Drop Table if exists data_clone_table_instructions;
+Create Table data_clone_table_instructions 
+	( 
+	tbl_name varchar(100) NOT NULL,
+    instruction char(7)
+	) Engine = InnoDB
+;
+
+#Tidy up exclusion instruction
+If Upper(instruction) In ('E', 'X', 'EX', 'EXCLUDE') Then 
+	
+    Set instruction = 'EXCLUDE'; 
+
+End If;
+
+#If instruction is not exclusion, set instruction to inclusion
+If Upper(instruction) != 'EXCLUDE' Then 
+
+	Set instruction = 'INCLUDE'; 
+
+End If;
+
+If tablename Like '%*%' Then 
+
+	Set tablename = Replace(tablename,'*','%');
+    
+    Insert Into data_clone_table_instructions 
+		(
+		tbl_name
+        ,instruction
+		)
+	Select
+		TABLE_NAME
+        ,instruction
+	From 
+		INFORMATION_SCHEMA.TABLES
+	Where
+		TABLE_TYPE = 'BASE TABLE'
+    And
+		TABLE_SCHEMA = schemaname
+	And
+		TABLE_NAME Like tablename
+	;
+		
+
+Else
+
+	Insert Into data_clone_table_instructions 
+		(
+		tbl_name
+        ,instruction
+		)
+	Select
+		tablename
+        ,instruction
+	From
+		Dual
+	Where
+		Not Exists (Select 1 From data_clone_table_instructions Where tbl_name = tablename)
+	;
+
+End If;
 
 End$$
